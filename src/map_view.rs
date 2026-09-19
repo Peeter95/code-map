@@ -9,6 +9,7 @@
 mod city;
 
 use crate::history::{self, History};
+use crate::i18n::Language;
 use crate::model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R};
 use crate::orbit::Orbit;
 use crate::scan::{self, Entry};
@@ -20,13 +21,68 @@ use std::{
     time::Instant,
 };
 
-/// Below this many screen pixels per line, a file is just a tinted box.
-const STRIPS_FROM_PX: f64 = 0.6;
-/// From this many pixels per line, draw the real text instead of strips.
-const TEXT_FROM_PX: f64 = 9.0;
-/// Hard cap on quads per frame, a safety net for huge projects.
-const QUAD_BUDGET: usize = 400_000;
-const LABEL_BUDGET: usize = 500;
+/// Runtime detail presets. Normal preserves the original rendering limits.
+/// Lower pixel thresholds reveal distant geometry; budgets bound CPU/GPU work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DetailLevel {
+    #[default]
+    Normal,
+    High,
+    Ultra,
+    Custom,
+}
+
+impl DetailLevel {
+    fn pixels(self, normal: f64, high: f64, ultra: f64, custom_percent: f64) -> f64 {
+        match self {
+            Self::Normal => normal,
+            Self::High => high,
+            Self::Ultra => ultra,
+            Self::Custom => {
+                let amount = (custom_percent / 100.0).clamp(0.0, 1.0);
+                normal + (ultra - normal) * amount
+            }
+        }
+    }
+
+    fn budget(self, normal: usize, high: usize, ultra: usize, custom_percent: f64) -> usize {
+        match self {
+            Self::Normal => normal,
+            Self::High => high,
+            Self::Ultra => ultra,
+            Self::Custom => ((normal as f64 * (custom_percent / 100.0).clamp(0.1, 10.0))
+                .round() as usize)
+                .max(1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CustomDetail {
+    pub geometry: f64,
+    pub text: f64,
+    pub budget: f64,
+}
+
+impl Default for CustomDetail {
+    fn default() -> Self {
+        Self {
+            geometry: 70.0,
+            text: 70.0,
+            budget: 200.0,
+        }
+    }
+}
+
+impl CustomDetail {
+    pub fn new(geometry: f64, text: f64, budget: f64) -> Self {
+        Self {
+            geometry: geometry.clamp(0.0, 100.0),
+            text: text.clamp(0.0, 100.0),
+            budget: budget.clamp(10.0, 1_000.0),
+        }
+    }
+}
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -127,6 +183,20 @@ enum ScanMsg {
     History(Result<History, String>),
 }
 
+#[derive(Clone, Debug, Default)]
+enum MapStatus {
+    #[default]
+    NoFolder,
+    Scanning,
+    ReadingHistory,
+    Summary,
+    Search,
+    Scanned { seconds: f64, used_git: bool },
+    ScanFailed(String),
+    ExpandedIgnored { path: String, count: usize },
+    HistoryFailed(String),
+}
+
 struct Label {
     rect: Rect,
     text: String,
@@ -211,6 +281,12 @@ pub struct CodeMap {
     #[rust]
     mode_3d: bool,
     #[rust]
+    detail_level: DetailLevel,
+    #[rust]
+    custom_detail: CustomDetail,
+    #[rust]
+    language: Language,
+    #[rust]
     orbit: Orbit,
     /// Where the 3D camera is flying to: (target, distance).
     #[rust]
@@ -248,6 +324,8 @@ pub struct CodeMap {
     #[rust]
     text_cache: HashMap<usize, Vec<String>>,
     #[rust]
+    status: MapStatus,
+    #[rust]
     message: String,
     #[rust]
     labels: Vec<Label>,
@@ -267,7 +345,7 @@ impl CodeMap {
         self.tx = Some(tx);
         self.rx = Some(rx);
         self.pending = 1;
-        self.set_status(cx, format!("Scanning {} ...", root.display()));
+        self.set_status(cx, MapStatus::Scanning);
         // Scanning runs on a background thread so the window stays responsive.
         // `move` hands ownership of `root` and the sender to that thread.
         std::thread::spawn(move || {
@@ -279,9 +357,46 @@ impl CodeMap {
         self.redraw(cx);
     }
 
-    fn set_status(&mut self, cx: &mut Cx, message: String) {
-        self.message = message;
+    fn status_message(&self) -> String {
+        match &self.status {
+            MapStatus::NoFolder => self.language.no_folder().to_string(),
+            MapStatus::Scanning => self.language.scanning(&self.root.display().to_string()),
+            MapStatus::ReadingHistory => self.language.reading_history(),
+            MapStatus::Summary => self.summary(),
+            MapStatus::Search => self
+                .language
+                .search_matches(&fmt_num(self.matches.len() as u64), &self.search),
+            MapStatus::Scanned { seconds, used_git } => {
+                self.language.scanned(&self.summary(), *seconds, *used_git)
+            }
+            MapStatus::ScanFailed(error) => self.language.scan_failed(error),
+            MapStatus::ExpandedIgnored { path, count } => self
+                .language
+                .expanded_ignored(path, &fmt_num(*count as u64)),
+            MapStatus::HistoryFailed(error) => self.language.history_failed(error),
+        }
+    }
+
+    fn publish_status(&mut self, cx: &mut Cx) {
+        self.message = self.status_message();
         cx.widget_action(self.uid, CodeMapAction::Status(self.message.clone()));
+    }
+
+    fn set_status(&mut self, cx: &mut Cx, status: MapStatus) {
+        self.status = status;
+        self.publish_status(cx);
+    }
+
+    pub fn set_language(&mut self, cx: &mut Cx, language: Language) {
+        if self.language == language {
+            return;
+        }
+        self.language = language;
+        self.publish_status(cx);
+        if let Some(index) = self.selected {
+            cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
+        }
+        self.redraw(cx);
     }
 
     pub fn set_show_ignored(&mut self, cx: &mut Cx, show: bool) {
@@ -290,11 +405,40 @@ impl CodeMap {
         self.redraw(cx);
     }
 
+    pub fn set_detail_level(&mut self, cx: &mut Cx, level: DetailLevel) {
+        if self.detail_level != level {
+            self.detail_level = level;
+            self.redraw(cx);
+        }
+    }
+
+    pub fn set_custom_detail(&mut self, cx: &mut Cx, detail: CustomDetail) {
+        if self.custom_detail != detail {
+            self.custom_detail = detail;
+            self.redraw(cx);
+        }
+    }
+
+    fn geometry_pixels(&self, normal: f64, high: f64, ultra: f64) -> f64 {
+        self.detail_level
+            .pixels(normal, high, ultra, self.custom_detail.geometry)
+    }
+
+    fn text_pixels(&self, normal: f64, high: f64, ultra: f64) -> f64 {
+        self.detail_level
+            .pixels(normal, high, ultra, self.custom_detail.text)
+    }
+
+    fn detail_budget(&self, normal: usize, high: usize, ultra: usize) -> usize {
+        self.detail_level
+            .budget(normal, high, ultra, self.custom_detail.budget)
+    }
+
     pub fn set_color_mode(&mut self, cx: &mut Cx, mode: ColorMode) {
         self.color_mode = mode;
         self.tree.compute_heat(mode);
         if mode != ColorMode::FileType && self.history.is_none() {
-            self.set_status(cx, "Reading git history ...".to_string());
+            self.set_status(cx, MapStatus::ReadingHistory);
         }
         self.redraw(cx);
     }
@@ -304,10 +448,9 @@ impl CodeMap {
         self.matches = self.tree.search(&self.search);
         self.match_cursor = 0;
         if self.search.is_empty() {
-            self.set_status(cx, self.summary());
+            self.set_status(cx, MapStatus::Summary);
         } else {
-            let text = format!("{} matches for \"{}\". Press Enter to fly to the next one.", fmt_num(self.matches.len() as u64), self.search);
-            self.set_status(cx, text);
+            self.set_status(cx, MapStatus::Search);
         }
         self.redraw(cx);
     }
@@ -400,11 +543,13 @@ impl CodeMap {
 
     fn summary(&self) -> String {
         let root = &self.tree.nodes[0];
-        let mut text = format!("{} files, {} lines", fmt_num(root.total_files), fmt_num(root.total_lines));
-        if let Some(h) = &self.history {
-            text.push_str(&format!(", {} commits of history", fmt_num(h.commits_read as u64)));
-        }
-        text
+        let files = fmt_num(root.total_files);
+        let lines = fmt_num(root.total_lines);
+        let commits = self
+            .history
+            .as_ref()
+            .map(|history| fmt_num(history.commits_read as u64));
+        self.language.summary(&files, &lines, commits.as_deref())
     }
 
     /// Pick up finished background work.
@@ -420,13 +565,7 @@ impl CodeMap {
                         self.tree.insert(entry);
                     }
                     self.tree.update_weights(true);
-                    let text = format!(
-                        "{}, scanned in {:.2}s ({})",
-                        self.summary(),
-                        secs,
-                        if used_git { "ignore rules from git" } else { "no git: read .gitignore files" }
-                    );
-                    self.set_status(cx, text);
+                    self.set_status(cx, MapStatus::Scanned { seconds: secs, used_git });
                     self.needs_layout = true;
                     self.needs_fit = true;
                     if used_git {
@@ -441,7 +580,7 @@ impl CodeMap {
                     }
                 }
                 ScanMsg::Project(Err(err), _) => {
-                    self.set_status(cx, format!("Could not scan: {err}"));
+                    self.set_status(cx, MapStatus::ScanFailed(err));
                 }
                 ScanMsg::Expanded(path, entries) => {
                     if let Some(index) = self.tree.find(&path) {
@@ -449,17 +588,17 @@ impl CodeMap {
                         self.tree.graft(index, entries);
                         self.after_tree_change();
                         self.selected = Some(index);
-                        self.set_status(cx, format!("Read ignored {path}: {} files", fmt_num(count as u64)));
+                        self.set_status(cx, MapStatus::ExpandedIgnored { path, count });
                     }
                 }
                 ScanMsg::History(Ok(history)) => {
                     self.tree.apply_history(&history);
                     self.history = Some(history);
                     self.tree.compute_heat(self.color_mode);
-                    self.set_status(cx, self.summary());
+                    self.set_status(cx, MapStatus::Summary);
                 }
                 ScanMsg::History(Err(err)) => {
-                    self.set_status(cx, format!("No git history: {err}"));
+                    self.set_status(cx, MapStatus::HistoryFailed(err));
                 }
             }
             self.redraw(cx);
@@ -532,28 +671,22 @@ impl CodeMap {
     fn info(&self, index: usize) -> NodeInfo {
         let n = &self.tree.nodes[index];
         let mut details = match n.kind {
-            Kind::Dir => format!(
-                "Folder\n{} files\n{} lines\n{}\n{} direct children",
-                fmt_num(n.total_files),
-                fmt_num(n.total_lines),
-                fmt_bytes(n.bytes),
-                n.children.len()
+            Kind::Dir => self.language.folder_details(
+                &fmt_num(n.total_files),
+                &fmt_num(n.total_lines),
+                &self.language.bytes(n.bytes),
+                n.children.len(),
             ),
             Kind::Text => {
                 let comments = n.lines.iter().filter(|l| l.comment).count();
-                format!(
-                    "Text file\n{} lines ({} comment lines)\n{}",
-                    fmt_num(n.lines.len() as u64),
-                    fmt_num(comments as u64),
-                    fmt_bytes(n.bytes)
+                self.language.text_file_details(
+                    &fmt_num(n.lines.len() as u64),
+                    &fmt_num(comments as u64),
+                    &self.language.bytes(n.bytes),
                 )
             }
-            Kind::Binary => format!("Binary or very large file\n{}", fmt_bytes(n.bytes)),
-            Kind::Ghost { dir, loading } => format!(
-                "Ignored {}\n{}",
-                if dir { "folder" } else { "file" },
-                if loading { "Reading it now ..." } else { "Not read yet. Click it to read it." }
-            ),
+            Kind::Binary => self.language.binary_details(&self.language.bytes(n.bytes)),
+            Kind::Ghost { dir, loading } => self.language.ignored_details(dir, loading),
         };
         if self.history.is_some() && !matches!(n.kind, Kind::Ghost { .. }) {
             if n.commits > 0 {
@@ -561,17 +694,16 @@ impl CodeMap {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                details.push_str(&format!(
-                    "\n\nGit: {} commits\nlast changed {}",
-                    fmt_num(n.commits as u64),
-                    fmt_age(now - n.last_change)
+                details.push_str(&self.language.git_details(
+                    &fmt_num(n.commits as u64),
+                    &self.language.age(now - n.last_change),
                 ));
             } else {
-                details.push_str("\n\nGit: no commits in history");
+                details.push_str(&self.language.no_commits());
             }
         }
         if n.ignored && !matches!(n.kind, Kind::Ghost { .. }) {
-            details.push_str("\n\nMatched by .gitignore");
+            details.push_str(&self.language.matched_gitignore());
         }
         NodeInfo {
             title: n.name.clone(),
@@ -599,6 +731,9 @@ impl CodeMap {
     fn draw_map(&mut self, cx: &mut Cx2d) {
         let view = self.view;
         let searching = self.search_active();
+        let quad_budget = self.detail_budget(400_000, 800_000, 1_200_000);
+        let min_node_px = self.geometry_pixels(0.5, 0.2, 0.1);
+        let child_px = self.geometry_pixels(4.0, 2.0, 0.75);
         let mut quads = 0usize;
         let mut stack = vec![0usize];
         while let Some(index) = stack.pop() {
@@ -611,11 +746,11 @@ impl CodeMap {
                 || r.pos.y > view.pos.y + view.size.y
                 || r.pos.x + r.size.x < view.pos.x
                 || r.pos.y + r.size.y < view.pos.y
-                || (r.size.x < 0.5 && r.size.y < 0.5)
+                || (r.size.x < min_node_px && r.size.y < min_node_px)
             {
                 continue;
             }
-            if quads > QUAD_BUDGET {
+            if quads > quad_budget {
                 break;
             }
             // search: things off the path to a match fade into the background
@@ -628,7 +763,7 @@ impl CodeMap {
                     let color = if node.ignored { vec4(shade * 1.3, shade, shade * 0.8, 1.0) } else { vec4(shade * 0.85, shade, shade * 1.25, 1.0) };
                     block(&mut self.draw_block, cx, r, scale_rgb(color, fade), vec4(0.0, 0.0, 0.0, 0.6), border, if node.ignored { 0.4 } else { 0.0 });
                     quads += 1;
-                    if small > 4.0 {
+                    if small > child_px {
                         stack.extend(node.children.iter().rev());
                         let (_, head) = frame(node.rect);
                         if head * self.cam_scale >= 13.0 && r.size.x > 50.0 && (!searching || node.on_path) {
@@ -658,7 +793,12 @@ impl CodeMap {
                     block(&mut self.draw_block, cx, r, scale_rgb(color, fade), vec4(0.45, 0.38, 0.25, fade), border, 1.0);
                     quads += 1;
                     if r.size.x > 60.0 && r.size.y > 18.0 {
-                        let text = if loading { format!("{} (reading...)", node.name) } else { format!("{} (ignored)", node.name) };
+                        let suffix = if loading {
+                            self.language.reading_suffix()
+                        } else {
+                            self.language.ignored_suffix()
+                        };
+                        let text = format!("{} ({suffix})", node.name);
                         self.labels.push(Label { rect: r, text, dim: true });
                     }
                 }
@@ -682,9 +822,12 @@ impl CodeMap {
         let line_px = node.line_h * self.cam_scale;
         let r_screen = self.to_screen(node.rect);
         let searching = self.search_active();
+        let strip_px = self.text_pixels(0.6, 0.35, 0.2);
+        let text_px = self.text_pixels(9.0, 7.0, 6.0);
+        let label_budget = self.detail_budget(500, 1_000, 1_500);
         let wants_label = r_screen.size.x > 60.0 && r_screen.size.y > 18.0 && (!searching || node.on_path);
-        if line_px < STRIPS_FROM_PX || node.lines.is_empty() {
-            if wants_label && self.labels.len() < LABEL_BUDGET {
+        if line_px < strip_px || node.lines.is_empty() {
+            if wants_label && self.labels.len() < label_budget {
                 self.labels.push(Label { rect: r_screen, text: node.name.clone(), dim: false });
             }
             return 0;
@@ -695,7 +838,7 @@ impl CodeMap {
         let char_px = line_px * CHAR_W;
         let col_px = COL_CHARS * char_px;
         let view = self.view;
-        let text_mode = line_px >= TEXT_FROM_PX;
+        let text_mode = line_px >= text_px;
         if text_mode {
             self.ensure_text(index);
         }
@@ -736,7 +879,7 @@ impl CodeMap {
                 }
             }
         }
-        if wants_label && self.labels.len() < LABEL_BUDGET {
+        if wants_label && self.labels.len() < label_budget {
             self.labels.push(Label { rect: r_screen, text: node.name.clone(), dim: false });
         }
         drawn
@@ -762,7 +905,8 @@ impl CodeMap {
 
     fn draw_labels(&mut self, cx: &mut Cx2d) {
         let labels = std::mem::take(&mut self.labels);
-        for label in labels.iter().take(LABEL_BUDGET) {
+        let budget = self.detail_budget(500, 1_000, 1_500);
+        for label in labels.iter().take(budget) {
             let pos = dvec2(label.rect.pos.x.max(self.view.pos.x) + 4.0, label.rect.pos.y.max(self.view.pos.y) + 3.0);
             let room = label.rect.pos.x + label.rect.size.x - pos.x - 8.0;
             if room < 20.0 {
@@ -824,7 +968,11 @@ impl Widget for CodeMap {
 
         if self.tree.is_empty() {
             self.draw_label.color = vec4(0.7, 0.7, 0.7, 1.0);
-            let message = if self.message.is_empty() { "No folder opened".to_string() } else { self.message.clone() };
+            let message = if self.message.is_empty() {
+                self.language.no_folder().to_string()
+            } else {
+                self.message.clone()
+            };
             self.draw_label.draw_abs(cx, rect.pos + dvec2(16.0, 16.0), &message);
             cx.end_turtle_with_area(&mut self.area);
             return DrawStep::done();
@@ -947,6 +1095,21 @@ impl CodeMapRef {
             inner.set_color_mode(cx, mode);
         }
     }
+    pub fn set_detail_level(&self, cx: &mut Cx, level: DetailLevel) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_detail_level(cx, level);
+        }
+    }
+    pub fn set_custom_detail(&self, cx: &mut Cx, detail: CustomDetail) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_custom_detail(cx, detail);
+        }
+    }
+    pub fn set_language(&self, cx: &mut Cx, language: Language) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_language(cx, language);
+        }
+    }
     pub fn set_search(&self, cx: &mut Cx, query: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_search(cx, query);
@@ -1034,22 +1197,26 @@ pub fn fmt_num(n: u64) -> String {
     out
 }
 
-pub fn fmt_bytes(b: u64) -> String {
-    match b {
-        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
-        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
-        b if b >= 1 << 10 => format!("{:.1} KB", b as f64 / 1024.0),
-        b => format!("{b} bytes"),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::{CustomDetail, DetailLevel};
 
-fn fmt_age(secs: i64) -> String {
-    let days = secs / 86_400;
-    match days {
-        d if d < 1 => "today".to_string(),
-        1 => "yesterday".to_string(),
-        d if d < 60 => format!("{d} days ago"),
-        d if d < 730 => format!("{} months ago", d / 30),
-        d => format!("{} years ago", d / 365),
+    #[test]
+    fn custom_detail_interpolates_thresholds_and_scales_budgets() {
+        assert_eq!(DetailLevel::Custom.pixels(10.0, 5.0, 2.0, 0.0), 10.0);
+        assert_eq!(DetailLevel::Custom.pixels(10.0, 5.0, 2.0, 100.0), 2.0);
+        assert_eq!(DetailLevel::Custom.budget(500, 1_000, 1_500, 250.0), 1_250);
+    }
+
+    #[test]
+    fn custom_detail_clamps_unsafe_external_values() {
+        assert_eq!(
+            CustomDetail::new(-5.0, 130.0, 2_000.0),
+            CustomDetail {
+                geometry: 0.0,
+                text: 100.0,
+                budget: 1_000.0,
+            }
+        );
     }
 }

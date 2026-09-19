@@ -16,15 +16,6 @@ use crate::orbit::{ray_box, Frame};
 const CITY_SIZE: f32 = 10.0;
 /// Thickness of one folder plate.
 const PLATE: f32 = 0.035;
-const CUBE_BUDGET: usize = 250_000;
-const LABELS_3D: usize = 120;
-/// At most this many files show their code on top at once (closest first).
-const CODE_PANELS: usize = 48;
-/// Caps so a zoomed-in view of huge files stays fast: text lines per file,
-/// text lines per frame, and line strips per frame.
-const PANEL_TEXT_LINES_PER_FILE: usize = 3000;
-const PANEL_TEXT_LINES: usize = 12_000;
-const PANEL_STRIPS: usize = 250_000;
 
 /// A file tower whose top is close enough to show code on it.
 struct CodePanel {
@@ -88,7 +79,8 @@ impl CodeMap {
 
         // biggest folders get labels first
         label_spots.sort_by(|a: &(f32, usize, Vec3f), b| b.0.total_cmp(&a.0));
-        for (px, index, point) in label_spots.into_iter().take(LABELS_3D) {
+        let label_budget = self.detail_budget(120, 240, 400);
+        for (px, index, point) in label_spots.into_iter().take(label_budget) {
             if let Some(p) = frame.project(point) {
                 let width = (px as f64).clamp(40.0, 260.0);
                 self.labels.push(Label {
@@ -113,6 +105,11 @@ impl CodeMap {
         let k = self.scale_3d();
         let (ox, oz) = (self.world.w as f32 * 0.5, self.world.h as f32 * 0.5);
         let searching = self.search_active();
+        let cube_budget = self.detail_budget(250_000, 350_000, 500_000);
+        let min_px = self.geometry_pixels(1.0, 0.35, 0.15) as f32;
+        let children_px = self.geometry_pixels(10.0, 4.0, 1.5) as f32;
+        let roof_px = self.geometry_pixels(40.0, 20.0, 10.0) as f32;
+        let label_px = self.geometry_pixels(90.0, 45.0, 25.0) as f32;
         let mut panels: Vec<CodePanel> = Vec::new();
         self.picks.clear();
         self.draw_cube.transform = Mat4f::identity();
@@ -126,7 +123,7 @@ impl CodeMap {
             if node.weight <= 0.0 {
                 continue;
             }
-            if self.picks.len() >= CUBE_BUDGET {
+            if self.picks.len() >= cube_budget {
                 break;
             }
             let r = node.rect;
@@ -151,7 +148,7 @@ impl CodeMap {
                 continue;
             }
             let px = frame.pixels_for(center, footprint);
-            if px < 1.0 {
+            if px < min_px {
                 continue;
             }
             let is_dir = node.kind == Kind::Dir;
@@ -190,23 +187,23 @@ impl CodeMap {
             self.draw_cube.draw(cx);
             self.picks.push((index, min, max));
 
-            if node.kind == Kind::Text && !node.lines.is_empty() && px > 40.0 {
+            if node.kind == Kind::Text && !node.lines.is_empty() && px > roof_px {
                 // measure from the closest point of the roof: using the tower's
                 // center breaks down when the camera hovers right above it
                 let roof = base + height;
                 let eye = frame.eye;
                 let nearest = vec3f(eye.x.clamp(x, x + w), roof, eye.z.clamp(z, z + d));
                 let line_px = frame.pixels_at_distance((nearest - eye).length(), node.line_h as f32 * k);
-                if line_px >= STRIPS_FROM_PX as f32 {
+                if line_px >= self.text_pixels(0.6, 0.35, 0.2) as f32 {
                     // lift the code a hair above the roof so it doesn't flicker (z-fighting)
                     let lift = (center - frame.eye).length() * 0.001;
                     panels.push(CodePanel { index, line_px, corner: vec3f(x, base + height + lift, z) });
                 }
             }
-            if is_dir && px > 10.0 {
+            if is_dir && px > children_px {
                 let top = base + height;
                 stack.extend(node.children.iter().rev().map(|&c| (c, top)));
-                if px > 90.0 && (!searching || node.on_path) {
+                if px > label_px && (!searching || node.on_path) {
                     label_spots.push((px, index, vec3f(center.x, top, center.z)));
                 }
             }
@@ -214,7 +211,7 @@ impl CodeMap {
         self.draw_cube.end_many_instances(cx);
 
         panels.sort_by(|a, b| b.line_px.total_cmp(&a.line_px));
-        panels.truncate(CODE_PANELS);
+        panels.truncate(self.detail_budget(48, 96, 160));
         self.draw_code_panels(cx, panels);
     }
 
@@ -224,13 +221,13 @@ impl CodeMap {
     /// Makepad's XR mode puts whole UI panels into 3D space the same way.
     fn draw_code_panels(&mut self, cx: &mut Cx3d, panels: Vec<CodePanel>) {
         let k = self.scale_3d() as f64;
-        let mut text_budget = PANEL_TEXT_LINES;
-        let mut strip_budget = PANEL_STRIPS;
+        let mut text_budget = self.detail_budget(12_000, 24_000, 48_000);
+        let mut strip_budget = self.detail_budget(250_000, 500_000, 750_000);
         for (slot, panel) in panels.iter().enumerate() {
             while self.code_lists.len() <= slot {
                 self.code_lists.push(DrawList::new(cx.cx));
             }
-            let text_mode = panel.line_px >= TEXT_FROM_PX as f32 && text_budget > 0;
+            let text_mode = panel.line_px >= self.text_pixels(9.0, 7.0, 6.0) as f32 && text_budget > 0;
             if text_mode {
                 self.ensure_text(panel.index);
             }
@@ -266,7 +263,7 @@ impl CodeMap {
             if text_mode {
                 self.draw_code.text_style.font_size = (local_line * 0.6) as f32;
             }
-            let lines = if text_mode { node.lines.len().min(PANEL_TEXT_LINES_PER_FILE) } else { node.lines.len().min(strip_budget) };
+            let lines = if text_mode { node.lines.len().min(self.detail_budget(3_000, 6_000, 9_000)) } else { node.lines.len().min(strip_budget) };
             if !text_mode {
                 strip_budget -= lines;
             }

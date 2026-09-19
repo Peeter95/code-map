@@ -6,6 +6,8 @@ default-run = "code-map"
 
 [dependencies]
 makepad-widgets = { path = "../makepad/widgets" }
+fluent-bundle = "0.15"
+unic-langid = "0.9"
 
 # Makepad replaces a few crates.io crates with its own copies. Its workspace
 # does this in its root Cargo.toml, so we repeat it here for our own crate.
