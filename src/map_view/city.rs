@@ -47,7 +47,12 @@ impl CodeMap {
         }
         self.pass_ready = true;
         self.color_texture = Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Auto, initial: true });
-        self.depth_texture = Texture::new_with_format(cx, TextureFormat::DepthD32 { size: TextureSize::Auto, initial: true });
+        // Sampled, not plain `DepthD32`: Makepad's desktop GL backend allocates
+        // a renderbuffer for the plain format but never attaches it to the
+        // pass framebuffer, so the depth test silently does nothing and far
+        // towers paint over near ones. The sampled variant is a depth texture
+        // that every backend attaches; we never read it back.
+        self.depth_texture = Texture::new_with_format(cx, TextureFormat::DepthD32Sampled { size: TextureSize::Auto, initial: true });
         cx.passes[self.pass.draw_pass_id()].keep_camera_matrix = true;
     }
 
