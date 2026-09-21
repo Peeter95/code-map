@@ -47,7 +47,12 @@ impl CodeMap {
         }
         self.pass_ready = true;
         self.color_texture = Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Auto, initial: true });
-        self.depth_texture = Texture::new_with_format(cx, TextureFormat::DepthD32 { size: TextureSize::Auto, initial: true });
+        // Sampled, not plain `DepthD32`: Makepad's desktop GL backend allocates
+        // a renderbuffer for the plain format but never attaches it to the
+        // pass framebuffer, so the depth test silently does nothing and far
+        // towers paint over near ones. The sampled variant is a depth texture
+        // that every backend attaches; we never read it back.
+        self.depth_texture = Texture::new_with_format(cx, TextureFormat::DepthD32Sampled { size: TextureSize::Auto, initial: true });
         cx.passes[self.pass.draw_pass_id()].keep_camera_matrix = true;
     }
 
@@ -83,6 +88,8 @@ impl CodeMap {
         cx.end_pass(&self.pass);
 
         self.draw_scene.draw_super.draw_vars.set_texture(0, &self.color_texture);
+        let flip = scene_texture_y_flip(cx.os_type());
+        self.draw_scene.draw_super.draw_vars.set_uniform(cx, live_id!(source_y_flip), &[flip]);
         self.draw_scene.draw_abs(cx, rect);
         cx.set_pass_area(&self.pass, self.draw_scene.draw_super.draw_vars.area);
 
@@ -386,6 +393,18 @@ impl CodeMap {
             }
             _ => {}
         }
+    }
+}
+
+/// Which way up the scene texture comes out of the pass. Makepad's desktop
+/// GL backend leaves a custom-camera pass (`keep_camera_matrix`) in classic
+/// bottom-up row order, while Metal and D3D11 store top-left rows and WebGL
+/// flips its projection to match them. Only the GL targets need the quad to
+/// sample upside down; the labels are projected on the CPU and never see it.
+fn scene_texture_y_flip(os: &OsType) -> f32 {
+    match os {
+        OsType::LinuxWindow(_) | OsType::LinuxDirect | OsType::Android(_) | OsType::OpenHarmony(_) => 1.0,
+        _ => 0.0,
     }
 }
 
