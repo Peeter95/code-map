@@ -55,11 +55,15 @@ script_mod! {
 
     // Shows the offscreen 3D render (a texture) as a flat quad in the UI,
     // like rendering a Three.js scene to a WebGLRenderTarget.
+    // `source_y_flip` is 1.0 where the render target stores its rows
+    // bottom-up (desktop GL), see `scene_texture_y_flip` in city.rs.
     set_type_default() do #(DrawSceneTexture::script_shader(vm)){
         ..mod.draw.DrawQuad
         scene_texture: texture_2d(float)
+        source_y_flip: uniform(0.0)
         pixel: fn() {
-            let c = self.scene_texture.sample_as_bgra(self.pos)
+            let uv = vec2(self.pos.x, mix(self.pos.y, 1.0 - self.pos.y, self.source_y_flip))
+            let c = self.scene_texture.sample_as_bgra(uv)
             return vec4(c.rgb * c.w, c.w)
         }
     }
