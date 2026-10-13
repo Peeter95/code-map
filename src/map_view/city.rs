@@ -264,7 +264,8 @@ impl CodeMap {
             let text_color = mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.8);
             let comment_color = vec4(0.35, 0.48, 0.35, 1.0);
             if text_mode {
-                self.draw_code.text_style.font_size = (local_line * 0.6) as f32;
+                self.draw_code.text_style.font_size =
+                    (local_line * 0.6).clamp(6.0, MAX_TEXT_PX).round() as f32;
             }
             let lines = if text_mode { node.lines.len().min(PANEL_TEXT_LINES_PER_FILE) } else { node.lines.len().min(strip_budget) };
             if !text_mode {
