@@ -375,7 +375,7 @@ impl CodeMap {
                 let frame = self.orbit.frame(self.view);
                 let (origin, dir) = frame.ray(e.abs);
                 let old = self.orbit.distance;
-                let new = (old * (e.scroll.y as f32 * 0.01).exp()).clamp(0.02, 60.0);
+                let new = (old * (wheel_units(e.scroll.y) as f32 * 0.01).exp()).clamp(0.02, 60.0);
                 if dir.y < -0.01 {
                     let t = -origin.y / dir.y;
                     let ground = origin + dir * t;

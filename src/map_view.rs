@@ -28,6 +28,18 @@ const TEXT_FROM_PX: f64 = 9.0;
 const QUAD_BUDGET: usize = 400_000;
 const LABEL_BUDGET: usize = 500;
 
+/// A wheel notch is 32 units on macOS (the Cocoa backend scales a non-precise
+/// notch by 32) and 120 units on Windows (`WHEEL_DELTA`). Rescale Windows
+/// deltas into macOS units so the same physical notch zooms by the same
+/// amount; the raw value moved the zoom ~3.75x further per notch.
+fn wheel_units(scroll_y: f64) -> f64 {
+    if cfg!(target_os = "windows") {
+        scroll_y * (32.0 / 120.0)
+    } else {
+        scroll_y
+    }
+}
+
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
@@ -801,7 +813,7 @@ impl CodeMap {
             Hit::FingerScroll(e) => {
                 self.flight = None;
                 // zoom around the point under the mouse
-                let factor = (-e.scroll.y * 0.01).exp();
+                let factor = (-wheel_units(e.scroll.y) * 0.01).exp();
                 let anchor = self.to_world(e.abs);
                 let min_scale = (self.view.size.x / self.world.w).min(self.view.size.y / self.world.h) * 0.5;
                 self.cam_scale = (self.cam_scale * factor).clamp(min_scale, min_scale * 200_000.0);
