@@ -24,9 +24,28 @@ use std::{
 const STRIPS_FROM_PX: f64 = 0.6;
 /// From this many pixels per line, draw the real text instead of strips.
 const TEXT_FROM_PX: f64 = 9.0;
+
+/// Ceiling on the code font size. Zoom keeps scaling the treemap, but glyph
+/// atlases, layout caches and the GPU upload budget do not: each new size is
+/// a fresh text-cache key, so an unbounded size re-rasterises every visible
+/// string on every zoom step until those budgets run out and the frame has
+/// nothing left to present. Capped far above any readable size.
+const MAX_TEXT_PX: f64 = 256.0;
 /// Hard cap on quads per frame, a safety net for huge projects.
 const QUAD_BUDGET: usize = 400_000;
 const LABEL_BUDGET: usize = 500;
+
+/// A wheel notch is 32 units on macOS (the Cocoa backend scales a non-precise
+/// notch by 32) and 120 units on Windows (`WHEEL_DELTA`). Rescale Windows
+/// deltas into macOS units so the same physical notch zooms by the same
+/// amount; the raw value moved the zoom ~3.75x further per notch.
+fn wheel_units(scroll_y: f64) -> f64 {
+    if cfg!(target_os = "windows") {
+        scroll_y * (32.0 / 120.0)
+    } else {
+        scroll_y
+    }
+}
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -710,7 +729,10 @@ impl CodeMap {
         let first_row = ((view.pos.y - inner.pos.y) / line_px).floor().max(0.0) as usize;
         let last_row = ((((view.pos.y + view.size.y) - inner.pos.y) / line_px).ceil().max(0.0) as usize).min(rows);
         if text_mode {
-            self.draw_code.text_style.font_size = (line_px * 0.6) as f32;
+            // Quantised to whole pixels: an unquantised size would mint a new
+            // cache key on every frame of a continuous zoom.
+            self.draw_code.text_style.font_size =
+                (line_px * 0.6).clamp(6.0, MAX_TEXT_PX).round() as f32;
         }
         for col in first_col..last_col {
             for row in first_row..last_row {
@@ -801,7 +823,7 @@ impl CodeMap {
             Hit::FingerScroll(e) => {
                 self.flight = None;
                 // zoom around the point under the mouse
-                let factor = (-e.scroll.y * 0.01).exp();
+                let factor = (-wheel_units(e.scroll.y) * 0.01).exp();
                 let anchor = self.to_world(e.abs);
                 let min_scale = (self.view.size.x / self.world.w).min(self.view.size.y / self.world.h) * 0.5;
                 self.cam_scale = (self.cam_scale * factor).clamp(min_scale, min_scale * 200_000.0);
